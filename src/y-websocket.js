@@ -113,12 +113,15 @@ const permissionDeniedHandler = (provider, reason) =>
 const readMessage = (provider, buf, emitSynced) => {
   const decoder = decoding.createDecoder(buf)
   const encoder = encoding.createEncoder()
-  const messageType = decoding.readVarUint(decoder)
-  const messageHandler = provider.messageHandlers[messageType]
-  if (/** @type {any} */ (messageHandler)) {
-    messageHandler(encoder, decoder, provider, emitSynced, messageType)
-  } else {
-    console.error('Unable to compute message')
+  try {
+    const messageType = decoding.readVarUint(decoder)
+    const messageHandler = provider.messageHandlers[messageType]
+    if (/** @type {any} */ (messageHandler)) {
+      messageHandler(encoder, decoder, provider, emitSynced, messageType)
+    } else {
+      console.error('Unable to compute message')
+    }
+  } catch (e) {
   }
   return encoder
 }
@@ -137,9 +140,31 @@ const setupWS = (provider) => {
 
     websocket.onmessage = (event) => {
       provider.wsLastMessageReceived = time.getUnixTime()
-      const encoder = readMessage(provider, new Uint8Array(event.data), true)
-      if (encoding.length(encoder) > 1) {
+      let ab = new Uint8Array(event.data)
+      let stringEventData = String.fromCharCode.apply(null, ab)
+      if (stringEventData === 'SedestralSync#!') {
+        // always send sync step 1 when connected
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, messageSync)
+        syncProtocol.writeSyncStep1(encoder, provider.doc)
         websocket.send(encoding.toUint8Array(encoder))
+        // broadcast local awareness state
+        if (provider.awareness.getLocalState() !== null) {
+          const encoderAwarenessState = encoding.createEncoder()
+          encoding.writeVarUint(encoderAwarenessState, messageAwareness)
+          encoding.writeVarUint8Array(
+            encoderAwarenessState,
+            awarenessProtocol.encodeAwarenessUpdate(provider.awareness, [
+              provider.doc.clientID
+            ])
+          )
+          websocket.send(encoding.toUint8Array(encoderAwarenessState))
+        }
+      } else {
+        const encoder = readMessage(provider, ab, true)
+        if (encoding.length(encoder) > 1) {
+          websocket.send(encoding.toUint8Array(encoder))
+        }
       }
     }
     websocket.onerror = (event) => {
@@ -185,23 +210,6 @@ const setupWS = (provider) => {
       provider.emit('status', [{
         status: 'connected'
       }])
-      // always send sync step 1 when connected
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, messageSync)
-      syncProtocol.writeSyncStep1(encoder, provider.doc)
-      websocket.send(encoding.toUint8Array(encoder))
-      // broadcast local awareness state
-      if (provider.awareness.getLocalState() !== null) {
-        const encoderAwarenessState = encoding.createEncoder()
-        encoding.writeVarUint(encoderAwarenessState, messageAwareness)
-        encoding.writeVarUint8Array(
-          encoderAwarenessState,
-          awarenessProtocol.encodeAwarenessUpdate(provider.awareness, [
-            provider.doc.clientID
-          ])
-        )
-        websocket.send(encoding.toUint8Array(encoderAwarenessState))
-      }
     }
 
     provider.emit('status', [{
@@ -367,7 +375,7 @@ export class WebsocketProvider extends Observable {
       if (
         this.wsconnected &&
         messageReconnectTimeout <
-          time.getUnixTime() - this.wsLastMessageReceived
+        time.getUnixTime() - this.wsLastMessageReceived
       ) {
         // no message received in a long time - not even your own awareness
         // updates (which are updated every 15 seconds)
